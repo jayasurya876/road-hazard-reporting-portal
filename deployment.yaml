@@ -3,8 +3,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: road-hazard-portal
-  labels:
-    app: road-hazard-portal
 spec:
   replicas: 2
   revisionHistoryLimit: 5
@@ -18,32 +16,22 @@ spec:
     spec:
       containers:
         - name: portal
-          image: YOUR-DOCKERHUB-USERNAME/road-hazard-portal:1.0
-          imagePullPolicy: Always
+          image: road-hazard-portal:latest
+          imagePullPolicy: IfNotPresent
           ports:
-            - name: http
-              containerPort: 80
+            - containerPort: 80
           readinessProbe:
             httpGet:
-              path: /healthz
-              port: http
+              path: /
+              port: 80
             initialDelaySeconds: 2
             periodSeconds: 3
-            timeoutSeconds: 2
-            failureThreshold: 2
           livenessProbe:
             httpGet:
               path: /
-              port: http
-            initialDelaySeconds: 10
+              port: 80
+            initialDelaySeconds: 5
             periodSeconds: 10
-          resources:
-            requests:
-              cpu: 50m
-              memory: 32Mi
-            limits:
-              cpu: 250m
-              memory: 128Mi
 ---
 apiVersion: v1
 kind: Service
@@ -54,7 +42,6 @@ spec:
   selector:
     app: road-hazard-portal
   ports:
-    - name: http
-      port: 80
-      targetPort: http
+    - port: 80
+      targetPort: 80
       nodePort: 30080
