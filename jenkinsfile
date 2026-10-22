@@ -1,0 +1,235 @@
+
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+
+    parameters {
+        booleanParam(
+            name: 'FAULTY_RELEASE',
+            defaultValue: false,
+            description: 'Build a deliberately faulty image to test automatic rollback'
+        )
+
+        booleanParam(
+            name: 'DEPLOY',
+            defaultValue: true,
+            description: 'Deploy to the Docker Desktop Kubernetes cluster'
+        )
+    }
+
+    environment {
+        DOCKER_IMAGE = 'YOUR-DOCKERHUB-USERNAME/road-hazard-portal'
+        K8S_DEPLOYMENT = 'road-hazard-portal'
+        K8S_CONTAINER = 'portal'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                sh 'git log -1 --oneline'
+            }
+        }
+
+        stage('Parallel Validation') {
+            parallel {
+                stage('Validate HTML') {
+                    steps {
+                        sh '''
+                            set -eu
+                            test -s index.html
+                            grep -q 'Road Hazard Reporting Portal' index.html
+                            grep -q 'complaintRows' index.html
+                            echo "HTML validation passed"
+                        '''
+                    }
+                }
+
+                stage('Validate Kubernetes YAML') {
+                    steps {
+                        sh '''
+                            set -eu
+                            test -s deployment.yaml
+                            grep -q 'kind: Deployment' deployment.yaml
+                            grep -q 'kind: Service' deployment.yaml
+                            grep -q '/healthz' deployment.yaml
+                            echo "Manifest validation passed"
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    def faulty = params.FAULTY_RELEASE ? 'true' : 'false'
+
+                    sh """
+                        set -eu
+                        docker build \
+                          --build-arg FAULTY_RELEASE=${faulty} \
+                          -t ${DOCKER_IMAGE}:${BUILD_NUMBER} .
+                    """
+                }
+            }
+        }
+
+        stage('Test Docker Image') {
+            steps {
+                sh '''
+                    set -eu
+                    docker run -d --rm \
+                      --name road-hazard-test-${BUILD_NUMBER} \
+                      -p 127.0.0.1:18080:80 \
+                      ${DOCKER_IMAGE}:${BUILD_NUMBER}
+
+                    cleanup() {
+                      docker stop road-hazard-test-${BUILD_NUMBER} >/dev/null 2>&1 || true
+                    }
+                    trap cleanup EXIT
+
+                    for i in $(seq 1 15); do
+                      if curl -fsS http://127.0.0.1:18080/ >/dev/null; then
+                        break
+                      fi
+                      sleep 2
+                    done
+
+                    curl -fsS http://127.0.0.1:18080/ \
+                      | grep -q 'Road Hazard Reporting Portal'
+
+                    if [ "${FAULTY_RELEASE}" = "true" ]; then
+                      if curl -fsS http://127.0.0.1:18080/healthz >/dev/null; then
+                        echo "ERROR: faulty image unexpectedly passed readiness test"
+                        exit 1
+                      fi
+                      echo "Expected faulty health check detected"
+                    else
+                      curl -fsS http://127.0.0.1:18080/healthz \
+                        | grep -q 'healthy'
+                    fi
+                '''
+            }
+        }
+
+        stage('Archive Build Artifacts') {
+            steps {
+                archiveArtifacts(
+                    artifacts: 'index.html,Dockerfile,deployment.yaml,Jenkinsfile',
+                    fingerprint: true
+                )
+            }
+        }
+
+        stage('Push Image to Docker Hub') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'dockerhub-creds',
+                        usernameVariable: 'DH_USER',
+                        passwordVariable: 'DH_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                        set +x
+                        printf '%s' "$DH_TOKEN" |
+                          docker login -u "$DH_USER" --password-stdin
+
+                        docker push ${DOCKER_IMAGE}:${BUILD_NUMBER}
+
+                        docker logout
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to Kubernetes') {
+            when {
+                expression { return params.DEPLOY }
+            }
+            steps {
+                withCredentials([
+                    file(
+                        credentialsId: 'kubeconfig-docker-desktop',
+                        variable: 'KUBECONFIG'
+                    )
+                ]) {
+                    script {
+                        int rolloutResult = 0
+
+                        sh '''
+                            set -eu
+                            kubectl apply -f deployment.yaml
+                        '''
+
+                        sh """
+                            kubectl set image \
+                              deployment/${K8S_DEPLOYMENT} \
+                              ${K8S_CONTAINER}=${DOCKER_IMAGE}:${BUILD_NUMBER}
+                        """
+
+                        rolloutResult = sh(
+                            returnStatus: true,
+                            script: """
+                                kubectl rollout status \
+                                  deployment/${K8S_DEPLOYMENT} \
+                                  --timeout=90s
+                            """
+                        )
+
+                        if (rolloutResult != 0) {
+                            echo 'ROLLOUT FAILED: initiating automatic rollback'
+
+                            sh """
+                                kubectl rollout undo \
+                                  deployment/${K8S_DEPLOYMENT}
+                            """
+
+                            sh """
+                                kubectl rollout status \
+                                  deployment/${K8S_DEPLOYMENT} \
+                                  --timeout=120s
+                            """
+
+                            echo 'Previous stable Deployment restored.'
+
+                            error(
+                                'Release failed. Automatic rollback completed; ' +
+                                'this Jenkins build is intentionally marked FAILED.'
+                            )
+                        }
+
+                        sh """
+                            kubectl get deployment ${K8S_DEPLOYMENT}
+                            kubectl get pods -l app=${K8S_DEPLOYMENT}
+                            kubectl get service road-hazard-portal-service
+                        """
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Pipeline succeeded.'
+        }
+
+        failure {
+            echo 'Pipeline failed. Inspect the stage logs and Kubernetes events.'
+        }
+
+        always {
+            archiveArtifacts(
+                artifacts: 'index.html,Dockerfile,deployment.yaml,Jenkinsfile',
+                allowEmptyArchive: true
+            )
+        }
+    }
+}
